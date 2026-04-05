@@ -182,6 +182,10 @@ void naiveAttention(torch::Tensor Q, torch::Tensor K,
    WEEK 2 – Fused kernel
    Stores all scores in shared memory (one block per query row).
    Eliminates global memory round-trips between GEMM → mask → softmax → V.
+
+   Key fix over naive approach: all threads compute their assigned key scores
+   in parallel (each thread owns seq_len/bdim keys), with only O(log bdim)
+   syncs for the softmax reductions — not O(seq_len) syncs.
    ───────────────────────────────────────────── */
 
 __global__ void fusedAttentionKernel(const float* __restrict__ Q,
@@ -190,82 +194,75 @@ __global__ void fusedAttentionKernel(const float* __restrict__ Q,
                                       float* __restrict__ output,
                                       int seq_len, int embed_dim, float scale)
 {
-    int qi    = blockIdx.x;   /* query row this block owns */
-    int tid   = threadIdx.x;
-    int bdim  = blockDim.x;
-    int lane  = tid % WARP_SIZE;
-    int wid   = tid / WARP_SIZE;
-    int nwarp = bdim / WARP_SIZE;
+    int qi   = blockIdx.x;
+    int tid  = threadIdx.x;
+    int bdim = blockDim.x;
 
     /*
      * Shared memory layout:
-     *   [0 .. seq_len-1]        : attention scores for query qi
-     *   [seq_len .. seq_len+nwarp-1] : warp reduce scratch (reused for max/sum)
+     *   [0 .. seq_len-1]      : attention scores for query qi
+     *   [seq_len .. seq_len+bdim-1] : per-thread reduction scratch
      */
     extern __shared__ float smem[];
     float* scores  = smem;
     float* scratch = smem + seq_len;
 
-    /* ── Phase 1: compute score[j] = dot(Q[qi], K[j]) * scale ── */
-    for (int j = 0; j < seq_len; j++) {
-        float partial = 0.f;
-        /* mask early so we skip the dot product for future tokens */
-        if (j <= qi) {
-            for (int d = tid; d < embed_dim; d += bdim)
-                partial += Q[qi * embed_dim + d] * K[j * embed_dim + d];
-        }
-        /* warp reduce → per-warp partial in scratch */
-        partial = warpSum(partial);
-        if (lane == 0) scratch[wid] = partial;
-        __syncthreads();
-
-        if (tid == 0) {
+    /* ── Phase 1: each thread computes scores for its key positions in parallel ──
+     * Thread t handles keys t, t+bdim, t+2*bdim, ...
+     * Each dot product is computed independently (embed_dim loop per thread).
+     * This replaces the old serial j-loop with O(seq_len) __syncthreads().
+     */
+    for (int kj = tid; kj < seq_len; kj += bdim) {
+        if (kj <= qi) {
             float dot = 0.f;
-            for (int w = 0; w < nwarp; w++) dot += scratch[w];
-            scores[j] = (j <= qi) ? dot * scale : -1e20f;
+            for (int d = 0; d < embed_dim; d++)
+                dot += Q[qi * embed_dim + d] * K[kj * embed_dim + d];
+            scores[kj] = dot * scale;
+        } else {
+            scores[kj] = -1e20f;
         }
+    }
+    __syncthreads();
+
+    /* ── Phase 2: parallel softmax with tree reduction ── */
+    /* find max */
+    float lmax = -1e38f;
+    for (int kj = tid; kj < seq_len; kj += bdim)
+        lmax = fmaxf(lmax, scores[kj]);
+    scratch[tid] = lmax;
+    __syncthreads();
+    for (int s = bdim >> 1; s > 0; s >>= 1) {
+        if (tid < s) scratch[tid] = fmaxf(scratch[tid], scratch[tid + s]);
         __syncthreads();
     }
+    float rmax = scratch[0];
 
-    /* ── Phase 2: softmax over scores ── */
-    float lmax = -1e38f;
-    for (int j = tid; j < seq_len; j += bdim)
-        lmax = fmaxf(lmax, scores[j]);
-    lmax = warpMax(lmax);
-    if (lane == 0) scratch[wid] = lmax;
-    __syncthreads();
-
-    float rmax = (tid < nwarp) ? scratch[tid] : -1e38f;
-    rmax = warpMax(rmax);
-    if (tid == 0) scratch[0] = rmax;
-    __syncthreads();
-    rmax = scratch[0];
-
+    /* exp and partial sum */
     float lsum = 0.f;
-    for (int j = tid; j < seq_len; j += bdim) {
-        float e = expf(scores[j] - rmax);
-        scores[j] = e;
+    for (int kj = tid; kj < seq_len; kj += bdim) {
+        float e = expf(scores[kj] - rmax);
+        scores[kj] = e;
         lsum += e;
     }
-    lsum = warpSum(lsum);
-    if (lane == 0) scratch[wid] = lsum;
+    scratch[tid] = lsum;
+    __syncthreads();
+    for (int s = bdim >> 1; s > 0; s >>= 1) {
+        if (tid < s) scratch[tid] += scratch[tid + s];
+        __syncthreads();
+    }
+    float rsum = scratch[0];
     __syncthreads();
 
-    float rsum = (tid < nwarp) ? scratch[tid] : 0.f;
-    rsum = warpSum(rsum);
-    if (tid == 0) scratch[0] = rsum;
-    __syncthreads();
-    rsum = scratch[0];
-
-    for (int j = tid; j < seq_len; j += bdim)
-        scores[j] /= rsum;
+    /* normalize */
+    for (int kj = tid; kj < seq_len; kj += bdim)
+        scores[kj] /= rsum;
     __syncthreads();
 
-    /* ── Phase 3: output[qi][d] = sum_j( scores[j] * V[j][d] ) ── */
+    /* ── Phase 3: output[qi][d] = sum_kj( scores[kj] * V[kj][d] ) ── */
     for (int d = tid; d < embed_dim; d += bdim) {
         float acc = 0.f;
-        for (int j = 0; j < seq_len; j++)
-            acc += scores[j] * V[j * embed_dim + d];
+        for (int kj = 0; kj < seq_len; kj++)
+            acc += scores[kj] * V[kj * embed_dim + d];
         output[qi * embed_dim + d] = acc;
     }
 }
@@ -277,10 +274,9 @@ void fusedAttention(torch::Tensor Q, torch::Tensor K,
     int embed_dim = Q.size(1);
     float scale   = 1.f / sqrtf((float)embed_dim);
 
-    /* 128 threads: 4 warps handle dot product reductions well for embed_dim<=128 */
     const int BLOCK = 128;
-    int nwarp = BLOCK / WARP_SIZE;
-    size_t smem = ((size_t)seq_len + nwarp) * sizeof(float);
+    /* scores (seq_len) + reduction scratch (BLOCK) */
+    size_t smem = ((size_t)seq_len + BLOCK) * sizeof(float);
 
     fusedAttentionKernel<<<seq_len, BLOCK, smem>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
@@ -442,25 +438,13 @@ __global__ void sparseAttentionKernel(const float* __restrict__ Q,
     int b_start = row_ptr[qi_block];
     int b_end   = row_ptr[qi_block + 1];
 
-    /* ── pass 1: find max over all valid key positions in non-zero blocks ── */
+    /*
+     * Online softmax (single pass) — avoids recomputing all dot products twice.
+     * Maintains running max and rescales the accumulator whenever a new max is found.
+     * Numerically equivalent to the two-pass approach.
+     */
     float max_val = -1e38f;
-    for (int b = b_start; b < b_end; b++) {
-        int kj_blk = col_idx[b];
-        int kj0    = kj_blk * block_w;
-        int kj1    = min(kj0 + block_w, seq_len);
-        for (int kj = kj0; kj < kj1; kj++) {
-            /* causal token-level mask inside each block */
-            if (kj > qi) continue;
-            float dot = 0.f;
-            for (int d = 0; d < embed_dim; d++)
-                dot += Q[qi * embed_dim + d] * K[kj * embed_dim + d];
-            max_val = fmaxf(max_val, dot * scale);
-        }
-    }
-
-    /* ── pass 2: weighted sum ── */
     float sum_exp = 0.f;
-    /* keep output in registers; embed_dim is small (64 in tests) */
     float out[128];
     for (int d = 0; d < embed_dim; d++) out[d] = 0.f;
 
@@ -473,7 +457,16 @@ __global__ void sparseAttentionKernel(const float* __restrict__ Q,
             float dot = 0.f;
             for (int d = 0; d < embed_dim; d++)
                 dot += Q[qi * embed_dim + d] * K[kj * embed_dim + d];
-            float w = expf(dot * scale - max_val);
+            dot *= scale;
+
+            if (dot > max_val) {
+                /* rescale existing accumulator to new max */
+                float rescale = expf(max_val - dot);
+                sum_exp *= rescale;
+                for (int d = 0; d < embed_dim; d++) out[d] *= rescale;
+                max_val = dot;
+            }
+            float w = expf(dot - max_val);
             sum_exp += w;
             for (int d = 0; d < embed_dim; d++)
                 out[d] += w * V[kj * embed_dim + d];
