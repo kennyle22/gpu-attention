@@ -418,9 +418,13 @@ void tcFusedAttention(torch::Tensor Q, torch::Tensor K,
 /*
  * sparseAttentionKernel
  *
- * Iterates only over non-zero key blocks as encoded in the CSR structure.
- * Two-pass (find max, then compute exp+sum) for numerical stability.
- * Local register array stores the output vector – works well for embed_dim<=128.
+ * One warp per query token: lane threads parallelize the embed_dim dot product.
+ * Online softmax in a single pass over non-zero CSR blocks.
+ * Output accumulation in shared memory (avoids hardcoded register array).
+ *
+ * Grid : (n_row_blocks,)
+ * Block: block_h * WARP_SIZE threads  (block_h warps, one warp per query)
+ * Smem : block_h * embed_dim floats
  */
 __global__ void sparseAttentionKernel(const float* __restrict__ Q,
                                        const float* __restrict__ K,
@@ -431,22 +435,24 @@ __global__ void sparseAttentionKernel(const float* __restrict__ Q,
                                        int block_h, int block_w)
 {
     int qi_block = blockIdx.x;
-    int qi_local = threadIdx.x;   /* which query within the block */
-    int qi       = qi_block * block_h + qi_local;
+    int warp_id  = threadIdx.x / WARP_SIZE;  /* which query within block */
+    int lane     = threadIdx.x % WARP_SIZE;  /* lane within warp          */
+    int qi       = qi_block * block_h + warp_id;
     if (qi >= seq_len) return;
+
+    /* each warp owns a contiguous embed_dim slice of shared memory */
+    extern __shared__ float smem[];
+    float* warp_out = smem + warp_id * embed_dim;
+    for (int d = lane; d < embed_dim; d += WARP_SIZE)
+        warp_out[d] = 0.f;
+    __syncwarp();
 
     int b_start = row_ptr[qi_block];
     int b_end   = row_ptr[qi_block + 1];
 
-    /*
-     * Online softmax (single pass) — avoids recomputing all dot products twice.
-     * Maintains running max and rescales the accumulator whenever a new max is found.
-     * Numerically equivalent to the two-pass approach.
-     */
+    /* online softmax: running max + rescaled accumulator (single pass) */
     float max_val = -1e38f;
     float sum_exp = 0.f;
-    float out[128];
-    for (int d = 0; d < embed_dim; d++) out[d] = 0.f;
 
     for (int b = b_start; b < b_end; b++) {
         int kj_blk = col_idx[b];
@@ -454,28 +460,32 @@ __global__ void sparseAttentionKernel(const float* __restrict__ Q,
         int kj1    = min(kj0 + block_w, seq_len);
         for (int kj = kj0; kj < kj1; kj++) {
             if (kj > qi) continue;
-            float dot = 0.f;
-            for (int d = 0; d < embed_dim; d++)
-                dot += Q[qi * embed_dim + d] * K[kj * embed_dim + d];
-            dot *= scale;
 
+            /* parallel dot product: each lane sums over d, d+32, d+64 … */
+            float dot = 0.f;
+            for (int d = lane; d < embed_dim; d += WARP_SIZE)
+                dot += Q[qi * embed_dim + d] * K[kj * embed_dim + d];
+            /* warpSum broadcasts the full dot product to every lane */
+            dot = warpSum(dot) * scale;
+
+            /* update running max and rescale accumulator if needed */
             if (dot > max_val) {
-                /* rescale existing accumulator to new max */
                 float rescale = expf(max_val - dot);
                 sum_exp *= rescale;
-                for (int d = 0; d < embed_dim; d++) out[d] *= rescale;
+                for (int d = lane; d < embed_dim; d += WARP_SIZE)
+                    warp_out[d] *= rescale;
                 max_val = dot;
             }
             float w = expf(dot - max_val);
             sum_exp += w;
-            for (int d = 0; d < embed_dim; d++)
-                out[d] += w * V[kj * embed_dim + d];
+            for (int d = lane; d < embed_dim; d += WARP_SIZE)
+                warp_out[d] += w * V[kj * embed_dim + d];
         }
     }
 
-    /* normalize and write */
-    for (int d = 0; d < embed_dim; d++)
-        output[qi * embed_dim + d] = out[d] / sum_exp;
+    /* normalize and write output */
+    for (int d = lane; d < embed_dim; d += WARP_SIZE)
+        output[qi * embed_dim + d] = warp_out[d] / sum_exp;
 }
 
 void sparseAttention(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
@@ -488,8 +498,11 @@ void sparseAttention(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     float scale   = 1.f / sqrtf((float)embed_dim);
     int n_row_blk = (seq_len + block_h - 1) / block_h;
 
-    /* one CUDA block per query-block row, block_h threads per block */
-    sparseAttentionKernel<<<n_row_blk, block_h>>>(
+    /* block_h warps per CUDA block, WARP_SIZE threads per warp */
+    int threads = block_h * WARP_SIZE;
+    size_t smem = (size_t)block_h * embed_dim * sizeof(float);
+
+    sparseAttentionKernel<<<n_row_blk, threads, smem>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
         output.data_ptr<float>(),
         row_ptr.data_ptr<int>(), col_idx.data_ptr<int>(),
