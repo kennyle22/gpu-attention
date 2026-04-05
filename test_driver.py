@@ -222,7 +222,7 @@ def test_week3(Q, K, V, ref, ref_ms, seq_len):
     return ms
 
 
-def test_week4(Q, K, V, seq_len):
+def test_week4(Q, K, V, seq_len, naive_ms, fused_ms):
     print("\n── Week 4: Block-Sparse Attention ──")
 
     block_h, block_w = 16, 16
@@ -252,7 +252,9 @@ def test_week4(Q, K, V, seq_len):
     tp = throughput(seq_len, ms)
     print(f"Avg CUDA time         : {ms:.4f} ms")
     print(f"Throughput            : {tp:.1f} seq/s")
-    print(f"Speedup vs. reference : {ref_ms / ms:.4f}x")
+    print(f"Speedup vs. naive     : {naive_ms / ms:.4f}x  (target ≥2×)")
+    print(f"Speedup vs. fused     : {fused_ms / ms:.4f}x")
+    print(f"Speedup vs. PyTorch   : {ref_ms / ms:.4f}x")
     return ms
 
 
@@ -305,7 +307,7 @@ def main(args):
     naive_ms = test_week1(Q, K, V, ref, ref_ms, seq_len)
     fused_ms = test_week2(Q, K, V, ref, ref_ms, seq_len, naive_ms)
     tc_ms    = test_week3(Q, K, V, ref, ref_ms, seq_len)
-    sparse_ms = test_week4(Q, K, V, seq_len)
+    sparse_ms = test_week4(Q, K, V, seq_len, naive_ms, fused_ms)
 
     # ── summary table ──
     print("\n" + "=" * 60)

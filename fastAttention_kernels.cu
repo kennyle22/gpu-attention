@@ -179,92 +179,115 @@ void naiveAttention(torch::Tensor Q, torch::Tensor K,
 }
 
 /* ─────────────────────────────────────────────
-   WEEK 2 – Fused kernel
-   Stores all scores in shared memory (one block per query row).
-   Eliminates global memory round-trips between GEMM → mask → softmax → V.
+   WEEK 2 – Tiled Fused Kernel (FlashAttention-style)
 
-   Key fix over naive approach: all threads compute their assigned key scores
-   in parallel (each thread owns seq_len/bdim keys), with only O(log bdim)
-   syncs for the softmax reductions — not O(seq_len) syncs.
+   One CUDA block handles TILE_Q query rows; one warp owns each row.
+   K and V tiles (TILE_KV rows) are loaded once into shared memory and
+   reused across all TILE_Q warps — amortizing bandwidth TILE_Q-fold.
+   Online softmax (single pass over KV tiles) avoids materializing the
+   O(seq_len) score array in shared memory.
+
+   Shared memory layout (per block):
+     Q_smem  [TILE_Q  × embed_dim]   cached Q tile
+     KV_smem [TILE_KV × embed_dim]   reused for K then V each tile
+     out_smem[TILE_Q  × embed_dim]   per-warp output accumulator
    ───────────────────────────────────────────── */
 
-__global__ void fusedAttentionKernel(const float* __restrict__ Q,
-                                      const float* __restrict__ K,
-                                      const float* __restrict__ V,
-                                      float* __restrict__ output,
-                                      int seq_len, int embed_dim, float scale)
+#define TILE_Q  16
+#define TILE_KV 32
+
+__global__ void fusedAttentionTiledKernel(const float* __restrict__ Q,
+                                           const float* __restrict__ K,
+                                           const float* __restrict__ V,
+                                           float* __restrict__ output,
+                                           int seq_len, int embed_dim, float scale)
 {
-    int qi   = blockIdx.x;
-    int tid  = threadIdx.x;
-    int bdim = blockDim.x;
+    int warp_id = threadIdx.x / WARP_SIZE;  /* query within tile  [0, TILE_Q) */
+    int lane    = threadIdx.x % WARP_SIZE;  /* lane within warp   [0, 32)     */
+    int qi      = blockIdx.x * TILE_Q + warp_id;
 
-    /*
-     * Shared memory layout:
-     *   [0 .. seq_len-1]      : attention scores for query qi
-     *   [seq_len .. seq_len+bdim-1] : per-thread reduction scratch
-     */
     extern __shared__ float smem[];
-    float* scores  = smem;
-    float* scratch = smem + seq_len;
+    float* Q_smem   = smem;
+    float* KV_smem  = smem + TILE_Q  * embed_dim;
+    float* out_smem = smem + (TILE_Q + TILE_KV) * embed_dim;
 
-    /* ── Phase 1: each thread computes scores for its key positions in parallel ──
-     * Thread t handles keys t, t+bdim, t+2*bdim, ...
-     * Each dot product is computed independently (embed_dim loop per thread).
-     * This replaces the old serial j-loop with O(seq_len) __syncthreads().
-     */
-    for (int kj = tid; kj < seq_len; kj += bdim) {
-        if (kj <= qi) {
-            float dot = 0.f;
-            for (int d = 0; d < embed_dim; d++)
-                dot += Q[qi * embed_dim + d] * K[kj * embed_dim + d];
-            scores[kj] = dot * scale;
-        } else {
-            scores[kj] = -1e20f;
+    /* cooperatively load Q tile and zero output accumulators */
+    for (int idx = threadIdx.x; idx < TILE_Q * embed_dim; idx += blockDim.x) {
+        int r    = idx / embed_dim, d = idx % embed_dim;
+        int qi_g = blockIdx.x * TILE_Q + r;
+        Q_smem[idx]   = (qi_g < seq_len) ? Q[qi_g * embed_dim + d] : 0.f;
+        out_smem[idx] = 0.f;
+    }
+    __syncthreads();
+
+    if (qi >= seq_len) return;
+
+    /* per-warp online softmax state (registers) */
+    float m_i = -1e38f;
+    float l_i = 0.f;
+
+    /* iterate over K/V tiles */
+    for (int kv0 = 0; kv0 < seq_len; kv0 += TILE_KV) {
+        int kv_end    = min(kv0 + TILE_KV, seq_len);
+        int tile_size = kv_end - kv0;
+
+        /* ── load K tile (coalesced across all threads in block) ── */
+        for (int idx = threadIdx.x; idx < TILE_KV * embed_dim; idx += blockDim.x) {
+            int kj_l = idx / embed_dim, d = idx % embed_dim;
+            int kj   = kv0 + kj_l;
+            KV_smem[idx] = (kj < seq_len) ? K[kj * embed_dim + d] : 0.f;
         }
-    }
-    __syncthreads();
-
-    /* ── Phase 2: parallel softmax with tree reduction ── */
-    /* find max */
-    float lmax = -1e38f;
-    for (int kj = tid; kj < seq_len; kj += bdim)
-        lmax = fmaxf(lmax, scores[kj]);
-    scratch[tid] = lmax;
-    __syncthreads();
-    for (int s = bdim >> 1; s > 0; s >>= 1) {
-        if (tid < s) scratch[tid] = fmaxf(scratch[tid], scratch[tid + s]);
         __syncthreads();
-    }
-    float rmax = scratch[0];
 
-    /* exp and partial sum */
-    float lsum = 0.f;
-    for (int kj = tid; kj < seq_len; kj += bdim) {
-        float e = expf(scores[kj] - rmax);
-        scores[kj] = e;
-        lsum += e;
-    }
-    scratch[tid] = lsum;
-    __syncthreads();
-    for (int s = bdim >> 1; s > 0; s >>= 1) {
-        if (tid < s) scratch[tid] += scratch[tid + s];
+        /* ── each warp computes TILE_KV scores (in registers, no smem needed) ── */
+        float scores[TILE_KV];
+        for (int kj_l = 0; kj_l < TILE_KV; kj_l++) {
+            int kj = kv0 + kj_l;
+            float dot = 0.f;
+            if (kj_l < tile_size && kj <= qi) {
+                for (int d = lane; d < embed_dim; d += WARP_SIZE)
+                    dot += Q_smem[warp_id * embed_dim + d] * KV_smem[kj_l * embed_dim + d];
+                dot = warpSum(dot) * scale;
+            } else {
+                dot = -1e20f;
+            }
+            scores[kj_l] = dot;
+        }
+
+        /* ── update running max; rescale accumulator ── */
+        float m_tile = -1e38f;
+        for (int kj_l = 0; kj_l < tile_size; kj_l++)
+            m_tile = fmaxf(m_tile, scores[kj_l]);
+
+        float m_new   = fmaxf(m_i, m_tile);
+        float rescale = expf(m_i - m_new);
+        l_i *= rescale;
+        for (int d = lane; d < embed_dim; d += WARP_SIZE)
+            out_smem[warp_id * embed_dim + d] *= rescale;
+        m_i = m_new;
+
+        /* ── swap K for V in KV_smem ── */
         __syncthreads();
-    }
-    float rsum = scratch[0];
-    __syncthreads();
+        for (int idx = threadIdx.x; idx < TILE_KV * embed_dim; idx += blockDim.x) {
+            int kj_l = idx / embed_dim, d = idx % embed_dim;
+            int kj   = kv0 + kj_l;
+            KV_smem[idx] = (kj < seq_len) ? V[kj * embed_dim + d] : 0.f;
+        }
+        __syncthreads();
 
-    /* normalize */
-    for (int kj = tid; kj < seq_len; kj += bdim)
-        scores[kj] /= rsum;
-    __syncthreads();
-
-    /* ── Phase 3: output[qi][d] = sum_kj( scores[kj] * V[kj][d] ) ── */
-    for (int d = tid; d < embed_dim; d += bdim) {
-        float acc = 0.f;
-        for (int kj = 0; kj < seq_len; kj++)
-            acc += scores[kj] * V[kj * embed_dim + d];
-        output[qi * embed_dim + d] = acc;
+        /* ── accumulate weighted V into per-warp output slice ── */
+        for (int kj_l = 0; kj_l < tile_size; kj_l++) {
+            float w = expf(scores[kj_l] - m_i);
+            l_i += w;
+            for (int d = lane; d < embed_dim; d += WARP_SIZE)
+                out_smem[warp_id * embed_dim + d] += w * KV_smem[kj_l * embed_dim + d];
+        }
+        __syncthreads();  /* protect KV_smem before next tile's K load */
     }
+
+    /* normalize and write output */
+    for (int d = lane; d < embed_dim; d += WARP_SIZE)
+        output[qi * embed_dim + d] = out_smem[warp_id * embed_dim + d] / l_i;
 }
 
 void fusedAttention(torch::Tensor Q, torch::Tensor K,
@@ -274,11 +297,12 @@ void fusedAttention(torch::Tensor Q, torch::Tensor K,
     int embed_dim = Q.size(1);
     float scale   = 1.f / sqrtf((float)embed_dim);
 
-    const int BLOCK = 128;
-    /* scores (seq_len) + reduction scratch (BLOCK) */
-    size_t smem = ((size_t)seq_len + BLOCK) * sizeof(float);
+    int blocks  = (seq_len + TILE_Q - 1) / TILE_Q;
+    int threads = TILE_Q * WARP_SIZE;
+    /* Q[TILE_Q*embed] + KV[TILE_KV*embed] + out[TILE_Q*embed] */
+    size_t smem = (size_t)(2 * TILE_Q + TILE_KV) * embed_dim * sizeof(float);
 
-    fusedAttentionKernel<<<seq_len, BLOCK, smem>>>(
+    fusedAttentionTiledKernel<<<blocks, threads, smem>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
         output.data_ptr<float>(), seq_len, embed_dim, scale);
 }
