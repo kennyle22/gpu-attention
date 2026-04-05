@@ -6,4 +6,4 @@
 #   source /pub/<yourUser>/project120/bin/activate
 #   bash build.sh
 
-TORCH_CUDA_ARCH_LIST="8.0 7.0" python setup.py install --verbose
+TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0" python setup.py install --verbose
