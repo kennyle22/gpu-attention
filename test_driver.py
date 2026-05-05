@@ -1,5 +1,5 @@
-"""
-test_driver.py – benchmark and correctness harness for all attention variants.
+﻿"""
+test_driver.py: benchmark and correctness harness for all attention variants.
 
 Usage:
     python test_driver.py --seq_len 1024 --embed_dim 64
@@ -18,15 +18,13 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 import fastAttention
 
 
-# ──────────────────────────────────────────────────────────────
-#  Block-sparse mask utilities
-# ──────────────────────────────────────────────────────────────
+# block-sparse mask utilities
 
 class CSRMatrix:
     """Block-CSR mask: row_ptr tracks non-zero block counts per block-row."""
     def __init__(self, row_ptr, col_idx, n_row_blocks, n_col_blocks):
-        self.row_ptr     = row_ptr
-        self.col_idx     = col_idx
+        self.row_ptr      = row_ptr
+        self.col_idx      = col_idx
         self.n_row_blocks = n_row_blocks
         self.n_col_blocks = n_col_blocks
 
@@ -35,7 +33,7 @@ def gen_causal_mask(seq_len, block_h, block_w):
     """
     Generate a block-causal CSR mask: block (r, c) is non-zero iff c <= r.
     This is the lower-triangular pattern in block space, matching the
-    element-level causal mask we use in the dense kernels.
+    element-level causal mask used in the dense kernels.
     """
     n_row_blk = (seq_len + block_h - 1) // block_h
     n_col_blk = (seq_len + block_w - 1) // block_w
@@ -91,16 +89,14 @@ def csr_to_dense_mask(mask, seq_len, block_h, block_w):
     dense = torch.full((seq_len, seq_len), float('-inf'), dtype=torch.float32, device='cuda')
     for r in range(n_row_blk):
         for b in range(mask.row_ptr[r], mask.row_ptr[r + 1]):
-            c    = mask.col_idx[b].item()
-            r0, r1 = r * block_h, min((r + 1) * block_h, seq_len)
-            c0, c1 = c * block_w, min((c + 1) * block_w, seq_len)
+            c       = mask.col_idx[b].item()
+            r0, r1  = r * block_h, min((r + 1) * block_h, seq_len)
+            c0, c1  = c * block_w, min((c + 1) * block_w, seq_len)
             dense[r0:r1, c0:c1] = 0.0   # 0 = keep, -inf = mask out
     return dense
 
 
-# ──────────────────────────────────────────────────────────────
-#  PyTorch reference (math backend so timing is fair)
-# ──────────────────────────────────────────────────────────────
+# PyTorch reference (math backend so timing is fair)
 
 def pytorch_reference(Q, K, V, attn_mask=None, warmup=5, niters=20):
     """
@@ -117,15 +113,15 @@ def pytorch_reference(Q, K, V, attn_mask=None, warmup=5, niters=20):
     with sdpa_kernel(backends=[SDPBackend.MATH]):
         for _ in range(warmup):
             out = F.scaled_dot_product_attention(Qu, Ku, Vu,
-                                                  attn_mask=attn_mask,
-                                                  dropout_p=0.0,
-                                                  scale=None)  # scale = 1/sqrt(d)
+                                                 attn_mask=attn_mask,
+                                                 dropout_p=0.0,
+                                                 scale=None)  # scale = 1/sqrt(d)
         start.record()
         for _ in range(niters):
             out = F.scaled_dot_product_attention(Qu, Ku, Vu,
-                                                  attn_mask=attn_mask,
-                                                  dropout_p=0.0,
-                                                  scale=None)
+                                                 attn_mask=attn_mask,
+                                                 dropout_p=0.0,
+                                                 scale=None)
         end.record()
 
     end.synchronize()
@@ -133,9 +129,7 @@ def pytorch_reference(Q, K, V, attn_mask=None, warmup=5, niters=20):
     return out.squeeze(0).squeeze(0), ms
 
 
-# ──────────────────────────────────────────────────────────────
-#  Timing helper
-# ──────────────────────────────────────────────────────────────
+# timing helper
 
 def time_kernel(fn, warmup=5, niters=20):
     """Returns average kernel time in milliseconds using CUDA events."""
@@ -161,12 +155,10 @@ def throughput(seq_len, ms):
     return 1000.0 / ms   # 1 sequence per ms, convert to /s
 
 
-# ──────────────────────────────────────────────────────────────
-#  Per-week test functions
-# ──────────────────────────────────────────────────────────────
+# per-week test functions
 
 def test_week1(Q, K, V, ref, ref_ms, seq_len):
-    print("\n── Week 1: Naive Attention ──")
+    print("\n-- Week 1: Naive Attention --")
     out = fastAttention.naive_attention(Q, K, V)
     print("Naive Attention Output (corner):")
     print(out[:3, :4])
@@ -175,8 +167,8 @@ def test_week1(Q, K, V, ref, ref_ms, seq_len):
     assert err < 1e-4, f"Week 1 correctness FAILED (err={err:.4e})"
     print("Correctness: PASSED")
 
-    ms = time_kernel(lambda: fastAttention.naive_attention(Q, K, V))
-    tp = throughput(seq_len, ms)
+    ms      = time_kernel(lambda: fastAttention.naive_attention(Q, K, V))
+    tp      = throughput(seq_len, ms)
     speedup = ref_ms / ms
     print(f"Avg CUDA time : {ms:.4f} ms")
     print(f"Throughput    : {tp:.1f} seq/s")
@@ -186,7 +178,7 @@ def test_week1(Q, K, V, ref, ref_ms, seq_len):
 
 
 def test_week2(Q, K, V, ref, ref_ms, seq_len, naive_ms):
-    print("\n── Week 2: Fused Attention ──")
+    print("\n-- Week 2: Fused Attention --")
     out = fastAttention.fused_attention(Q, K, V)
     print("Fused Attention Output (corner):")
     print(out[:3, :4])
@@ -205,7 +197,7 @@ def test_week2(Q, K, V, ref, ref_ms, seq_len, naive_ms):
 
 
 def test_week3(Q, K, V, ref, ref_ms, seq_len):
-    print("\n── Week 3: Tensor Core (Mixed-Precision) Attention ──")
+    print("\n-- Week 3: Tensor Core (Mixed-Precision) Attention --")
     out = fastAttention.tc_fused_attention(Q, K, V)
     print("TC Attention Output (corner):")
     print(out[:3, :4])
@@ -223,7 +215,7 @@ def test_week3(Q, K, V, ref, ref_ms, seq_len):
 
 
 def test_week4(Q, K, V, seq_len, naive_ms, fused_ms):
-    print("\n── Week 4: Block-Sparse Attention ──")
+    print("\n-- Week 4: Block-Sparse Attention --")
 
     block_h, block_w = 16, 16
     mask = gen_causal_mask(seq_len, block_h, block_w)
@@ -252,15 +244,13 @@ def test_week4(Q, K, V, seq_len, naive_ms, fused_ms):
     tp = throughput(seq_len, ms)
     print(f"Avg CUDA time         : {ms:.4f} ms")
     print(f"Throughput            : {tp:.1f} seq/s")
-    print(f"Speedup vs. naive     : {naive_ms / ms:.4f}x  (target ≥2×)")
+    print(f"Speedup vs. naive     : {naive_ms / ms:.4f}x  (target >=2x)")
     print(f"Speedup vs. fused     : {fused_ms / ms:.4f}x")
     print(f"Speedup vs. PyTorch   : {ref_ms / ms:.4f}x")
     return ms
 
 
-# ──────────────────────────────────────────────────────────────
-#  Torch profiler helper (single pass, detailed trace)
-# ──────────────────────────────────────────────────────────────
+# torch profiler helper
 
 def profile_variant(label, fn):
     """Run one warmup then profile a single iteration with torch.profiler."""
@@ -275,9 +265,7 @@ def profile_variant(label, fn):
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
 
-# ──────────────────────────────────────────────────────────────
-#  Main
-# ──────────────────────────────────────────────────────────────
+# main
 
 def main(args):
     seq_len   = args.seq_len
@@ -298,18 +286,18 @@ def main(args):
         float('-inf')
     )
 
-    print("\nRunning PyTorch reference (causal)…")
+    print("\nRunning PyTorch reference (causal)...")
     ref, ref_ms = pytorch_reference(Q, K, V, attn_mask=causal_mask)
     print(f"Reference time: {ref_ms:.4f} ms  |  throughput: {throughput(seq_len, ref_ms):.1f} seq/s")
     print("Reference Output (corner):")
     print(ref[:3, :4])
 
-    naive_ms = test_week1(Q, K, V, ref, ref_ms, seq_len)
-    fused_ms = test_week2(Q, K, V, ref, ref_ms, seq_len, naive_ms)
-    tc_ms    = test_week3(Q, K, V, ref, ref_ms, seq_len)
+    naive_ms  = test_week1(Q, K, V, ref, ref_ms, seq_len)
+    fused_ms  = test_week2(Q, K, V, ref, ref_ms, seq_len, naive_ms)
+    tc_ms     = test_week3(Q, K, V, ref, ref_ms, seq_len)
     sparse_ms = test_week4(Q, K, V, seq_len, naive_ms, fused_ms)
 
-    # ── summary table ──
+    # summary table
     print("\n" + "=" * 60)
     print(f"{'Variant':<25} {'Time (ms)':>10} {'Seq/s':>12} {'Speedup':>10}")
     print("-" * 60)
